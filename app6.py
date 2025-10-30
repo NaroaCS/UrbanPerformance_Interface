@@ -1,7 +1,7 @@
 import numpy as np
 import streamlit as st
 from plotly import graph_objects as go
-
+import base64, mimetypes, pathlib
 
 # ============================================================================
 # CONFIGURATION
@@ -141,7 +141,7 @@ def apply_custom_css():
 
 CITY_DATA = {
     "Skyhaven": {
-        "video_path": "city_skyhaven.mp4",
+        "video_path": "assets/temp.mov",
         "kpis": [
             {"name": "Inclusive GDP Growth", "category": "Economic", "value": 5.2},
             {"name": "Innovation Output", "category": "Economic", "value": 6.1},
@@ -163,7 +163,7 @@ CITY_DATA = {
         },
     },
     "Harborlight": {
-        "video_path": "city_harborlight.mp4",
+        "video_path": "assets/temp.mov",
         "kpis": [
             {"name": "Inclusive GDP Growth", "category": "Economic", "value": 4.3},
             {"name": "Innovation Output", "category": "Economic", "value": 4.9},
@@ -404,6 +404,21 @@ def create_time_series_chart(city_key: str, category_scores: dict):
     )
     return fig
 
+def autoplay_video(local_path: str, height: int = 360):
+    path = pathlib.Path(local_path)
+    mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
+    data64 = base64.b64encode(path.read_bytes()).decode()
+
+    st.components.v1.html(f"""
+      <div class="video-container" style="position:relative;padding-top:56.25%;">
+        <video autoplay loop muted playsinline preload="metadata"
+               style="position:absolute;inset:0;width:100%;height:100%;">
+          <source src="data:{mime};base64,{data64}" type="{mime}">
+          Your browser does not support the video tag.
+        </video>
+      </div>
+    """, height=height)
+
 
 # ============================================================================
 # UI COMPONENTS
@@ -511,9 +526,11 @@ def main():
         st.markdown("<div class='section-label'>Overview</div>", unsafe_allow_html=True)
         try:
             video_path = CITY_DATA[city_key]["video_path"]
-            st.markdown('<div class="video-container">', unsafe_allow_html=True)
-            st.video(video_path)
-            st.markdown('</div>', unsafe_allow_html=True)
+            #st.markdown('<div class="video-container">', unsafe_allow_html=True)
+            #st.video(video_path)
+            #st.markdown('</div>', unsafe_allow_html=True)
+            autoplay_video(video_path)
+           
         except Exception:
             st.info(f"📹 Place '{CITY_DATA[city_key]['video_path']}' here")
 
