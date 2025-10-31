@@ -141,7 +141,7 @@ def apply_custom_css():
 # ============================================================================
 
 CITY_DATA = {
-    "Skyhaven": {
+    "Boston": {
         "video_path": "assets/temp.mov",
         "kpis": [
                     # ENVIRONMENTAL
@@ -165,7 +165,7 @@ CITY_DATA = {
             "health": [84, 86, 88, 90, 92, 94, 97, 99, 101, 103, 106],
         },
     },
-    "Harborlight": {
+    "San Sebastian": {
         "video_path": "assets/temp.mov",
         "kpis": [
             # ENVIRONMENTAL
@@ -742,7 +742,7 @@ def main():
             value=st.session_state.get("city_search", ""),
             key="city_search",
             label_visibility="collapsed",
-            placeholder="Skyhaven or Harborlight"
+            placeholder="Search for a city...",
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
