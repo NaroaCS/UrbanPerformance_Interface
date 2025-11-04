@@ -319,7 +319,7 @@
         const targetScale = shouldBeTall ? heightScale : Math.min(heightScale, 8 / baseHeight);
         g.scale.y = targetScale;
       });
-      camera.position.set(0, 320, ORBIT_SNAPSHOT.distance);
+      camera.position.set(0, 360, ORBIT_SNAPSHOT.distance);
       controls.target.copy(ORBIT_SNAPSHOT.target);
       controls.update();
     }
