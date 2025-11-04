@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>3D City + Agents (OSM + Three.js) — XZ-Aligned</title>
+  <style>
+    html, body { margin:0; height:100%; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #ui { position: absolute; top: 12px; left: 12px; z-index: 10; background: rgba(255,255,255,0.9); padding: 12px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.15); display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+    #ui input[type="text"]{ padding:8px 10px; border-radius: 10px; border:1px solid #d0d0d0; min-width: 260px; }
+    #ui button { padding: 8px 12px; border-radius: 10px; border: 0; background: #111827; color: white; cursor: pointer; }
+    #ui button.secondary { background:#2563eb; }
+    #ui label { font-size: 12px; opacity: 0.8; }
+    #canvas { width: 100vw; height: 100vh; display:block; }
+    .pill { padding:4px 8px; background:#111827; color:#fff; border-radius:999px; font-size:12px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <span class="pill">Demo</span>
+    <input id="cityInput" type="text" placeholder="Search a city (e.g., Donostia, Spain)" />
+    <button id="searchBtn">Load Area</button>
+    <label>Area (km): <input id="areaKm" type="range" min="0.5" max="5" step="0.5" value="1.5" /></label>
+    <label>Height × <input id="heightScale" type="range" min="0.2" max="3" step="0.1" value="1" /></label>
+    <label><input id="tallMode" type="checkbox" /> Tall buildings only</label>
+    <label>Agents: <input id="agentCount" type="number" min="1" max="200" step="1" value="25" style="width:80px;"/></label>
+    <button class="secondary" id="spawnBtn">Spawn + Route</button>
+    <span id="status" style="font-size:12px; opacity:0.7"></span>
+  </div>
+  <canvas id="canvas"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+    // UI
+    const canvas = document.getElementById('canvas');
+    const cityInput = document.getElementById('cityInput');
+    const searchBtn = document.getElementById('searchBtn');
+    const heightScaleEl = document.getElementById('heightScale');
+    const tallModeEl = document.getElementById('tallMode');
+    const spawnBtn = document.getElementById('spawnBtn');
+    const agentCountEl = document.getElementById('agentCount');
+    const areaKmEl = document.getElementById('areaKm');
+    const statusEl = document.getElementById('status');
+
+    // Three.js
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x050810);
+    scene.fog = new THREE.Fog(0x050810, 2000, 12000);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200000);
+    camera.position.set(0, 400, 600);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0x8bb4ff, 0x1a2332, 0.8);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+    dir.color.setRGB(1.0, 0.98, 0.95);
+    dir.position.set(300, 600, 400);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    scene.add(dir);
+    const amb = new THREE.AmbientLight(0x3d5a7a, 1.0);
+    scene.add(amb);
+
+    // Ground (X–Z plane; Y = height)
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20000, 20000),
+      new THREE.MeshStandardMaterial({ color: 0x0d1821, metalness: 0.3, roughness: 0.95 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Groups
+    const buildingsGroup = new THREE.Group();
+    const roadsGroup = new THREE.Group();
+    const agentsGroup = new THREE.Group();
+    scene.add(buildingsGroup, roadsGroup, agentsGroup);
+
+    // State
+    let centerLL = null; // [lon, lat]
+    let areaKm = 1.5;
+    let heightScale = 1.0;
+    let tallModeOnly = false;
+
+    // Graph + nodes in scene coordinates (X,Z)
+    const nodeMap = new Map(); // osmNodeId -> {X,Z}
+    const graph = new Map();   // osmNodeId -> Array<{to, cost}>
+    let roadNodesKD = null;
+
+    // Helpers
+    function setStatus(msg){ if (statusEl) statusEl.textContent = msg; }
+
+    // Web Mercator projector -> scene X/Z (Y is height)
+    const R = 6378137;
+
+    function llToXZ(lon, lat, originLon, originLat) {
+    const λ  = THREE.MathUtils.degToRad(lon);
+    const φ  = THREE.MathUtils.degToRad(lat);
+    const λ0 = THREE.MathUtils.degToRad(originLon);
+    const φ0 = THREE.MathUtils.degToRad(originLat);
+
+    const mercY  = Math.log(Math.tan(Math.PI/4 + φ/2));
+    const mercY0 = Math.log(Math.tan(Math.PI/4 + φ0/2));
+
+    const X = R * (λ - λ0);
+    const Z = -R * (mercY - mercY0);   // ← NEGATE so north increases upward on the screen
+    return { X, Z };
+    }
+
+
+    function centroidXZ(coords) {
+      let cx = 0, cz = 0;
+      for (const c of coords) { cx += c.X; cz += c.Z; }
+      return { X: cx / coords.length, Z: cz / coords.length };
+    }
+
+    function clearCity() {
+      for (const g of [buildingsGroup, roadsGroup, agentsGroup]) {
+        while (g.children.length) g.remove(g.children[0]);
+      }
+      nodeMap.clear();
+      graph.clear();
+      roadNodesKD = null;
+    }
+
+    function makeLine(pointsXZ) {
+      const geom = new THREE.BufferGeometry();
+      const arr = new Float32Array(pointsXZ.length * 3);
+      for (let i=0;i<pointsXZ.length;i++){
+        arr[i*3+0]=pointsXZ[i].X;
+        arr[i*3+1]=2;          // Y
+        arr[i*3+2]=pointsXZ[i].Z;
+      }
+      geom.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+      const mat = new THREE.LineBasicMaterial({ color: 0x2a4a6a, transparent: true, opacity: 0.35 });
+      return new THREE.Line(geom, mat);
+    }
+
+    function makeAgent(pathXZ, speed=40) {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(2.0, 16, 16),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x3b82f6, emissiveIntensity: 1.2, roughness: 0.35, metalness: 0.25 })
+      );
+      mesh.castShadow = true;
+      agentsGroup.add(mesh);
+
+      const TRAIL_LEN = 120;
+      const MIN_STEP = 1.5;
+      const trailPositions = new Float32Array(TRAIL_LEN * 3);
+      const trailGeom = new THREE.BufferGeometry();
+      trailGeom.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+      trailGeom.setDrawRange(0, 0);
+      const trailMat = new THREE.LineBasicMaterial({ color: 0x60a5fa, transparent: true, opacity: 0.85, linewidth: 2 });
+      const trail = new THREE.Line(trailGeom, trailMat);
+      agentsGroup.add(trail);
+
+      let stamped = 0;
+      let lastStamp = null; // {X,Z}
+      function stamp(X,Z){
+        if (stamped >= TRAIL_LEN) {
+          trailPositions.copyWithin(0, 3, TRAIL_LEN*3);
+          stamped = TRAIL_LEN - 1;
+        }
+        const idx = stamped * 3;
+        trailPositions[idx] = X; trailPositions[idx+1] = 2.2; trailPositions[idx+2] = Z;
+        stamped++;
+        trailGeom.attributes.position.needsUpdate = true;
+        trailGeom.setDrawRange(0, stamped);
+      }
+
+      const segments = [];
+      for (let i=0;i<pathXZ.length-1;i++) {
+        const a = pathXZ[i], b = pathXZ[i+1];
+        const dx=b.X-a.X, dz=b.Z-a.Z; const len=Math.hypot(dx,dz);
+        segments.push({ a, b, len });
+      }
+      let segIdx = 0, t = 0;
+
+      function update(dt) {
+        if (segments.length === 0) return;
+        let remaining = speed * dt;
+        while (remaining > 0 && segIdx < segments.length) {
+          const s = segments[segIdx];
+          const move = Math.min(remaining, s.len - t);
+          t += move;
+          const r = s.len ? (t / s.len) : 1;
+          const X = s.a.X + (s.b.X - s.a.X) * r;
+          const Z = s.a.Z + (s.b.Z - s.a.Z) * r;
+          mesh.position.set(X, 3.5, Z);
+
+          if (!lastStamp) { lastStamp = {X,Z}; stamp(X,Z); }
+          else {
+            const dX = X - lastStamp.X, dZ = Z - lastStamp.Z;
+            if (dX*dX + dZ*dZ >= MIN_STEP*MIN_STEP) { stamp(X,Z); lastStamp = {X,Z}; }
+          }
+
+          remaining -= move;
+          if (t >= s.len) { segIdx++; t = 0; }
+        }
+      }
+      return { mesh, update };
+    }
+
+    const liveAgents = [];
+
+    function spawnAgents(n=25) {
+      if (!roadNodesKD || roadNodesKD.length < 2) return;
+      liveAgents.splice(0, liveAgents.length);
+      while (agentsGroup.children.length) agentsGroup.remove(agentsGroup.children[0]);
+
+      const bcentroids = buildingsGroup.children.map(m => ({ X: m.userData.cX, Z: m.userData.cZ }));
+      if (bcentroids.length < 2) return;
+
+      for (let i=0; i<n; i++) {
+        const o = bcentroids[Math.floor(Math.random()*bcentroids.length)];
+        const d = bcentroids[Math.floor(Math.random()*bcentroids.length)];
+        const oNode = nearestNode(o.X, o.Z);
+        const dNode = nearestNode(d.X, d.Z);
+        if (!oNode || !dNode) continue;
+        const ids = dijkstra(oNode, dNode);
+        if (!ids || ids.length < 2) continue;
+        const pts = ids.map(id => nodeMap.get(id)).map(p => ({ X:p.X, Z:p.Z }));
+        const agent = makeAgent(pts, 35 + Math.random()*20);
+        liveAgents.push(agent);
+      }
+    }
+
+    function nearestNode(X, Z) {
+      let best = null; let bestD = Infinity;
+      for (const p of roadNodesKD || []) {
+        const dx = p.X - X, dz = p.Z - Z; const d = dx*dx + dz*dz;
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      return best ? best.id : null;
+    }
+
+    function dijkstra(startId, goalId) {
+      const dist = new Map();
+      const prev = new Map();
+      const visited = new Set();
+      dist.set(startId, 0);
+      const pq = new Map([[startId, 0]]);
+      function popMin() {
+        let minKey=null, min=Infinity; 
+        for (const [k,v] of pq) { if (v<min) { min=v; minKey=k; } }
+        if (minKey!=null) pq.delete(minKey);
+        return minKey;
+      }
+      while (pq.size) {
+        const u = popMin();
+        if (!u) break;
+        if (u === goalId) break;
+        visited.add(u);
+        const edges = graph.get(u) || [];
+        for (const e of edges) {
+          if (visited.has(e.to)) continue;
+          const nd = (dist.get(u) ?? Infinity) + e.cost;
+          if (nd < (dist.get(e.to) ?? Infinity)) {
+            dist.set(e.to, nd);
+            prev.set(e.to, u);
+            pq.set(e.to, nd);
+          }
+        }
+      }
+      const path = [];
+      let cur = goalId;
+      if (!prev.has(cur) && cur !== startId) return null;
+      while (cur) { path.push(cur); if (cur === startId) break; cur = prev.get(cur); }
+      return path.reverse();
+    }
+
+    // Fetching
+    async function geocodeCity(q) {
+      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=1`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Geocoder HTTP ${res.status}`);
+      const js = await res.json();
+      if (!js.features || !js.features.length) throw new Error('Place not found');
+      const [lon, lat] = js.features[0].geometry.coordinates;
+      return { center: [lon, lat] };
+    }
+
+    async function fetchOverpass(center, km=1.5) {
+      const [lon, lat] = center;
+      const dLat = km / 110.574;
+      const dLon = km / (111.320 * Math.cos(THREE.MathUtils.degToRad(lat)));
+      const minLon = lon - dLon, maxLon = lon + dLon, minLat = lat - dLat, maxLat = lat + dLat;
+
+      const query = `[
+        out:json][timeout:25];
+        (
+          way["building"](${minLat},${minLon},${maxLat},${maxLon});
+          relation["building"](${minLat},${minLon},${maxLat},${maxLon});
+        );
+        out body; >; out skel qt;
+        (
+          way["highway"]["highway"!~"footway|path|track|service"](${minLat},${minLon},${maxLat},${maxLon});
+        ); out body; >; out skel qt;`;
+
+      const endpoints = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter'
+      ];
+      let lastErr;
+      for (const url of endpoints) {
+        try {
+          const ctrl = new AbortController();
+          const to = setTimeout(() => ctrl.abort(), 25000);
+          const res = await fetch(url, { method: 'POST', body: query, headers: { 'Content-Type': 'text/plain' }, signal: ctrl.signal });
+          clearTimeout(to);
+          if (res.ok) return await res.json();
+          lastErr = new Error(`Overpass HTTP ${res.status}`);
+        } catch (e) { lastErr = e; }
+      }
+      throw lastErr || new Error('Overpass failed');
+    }
+
+    function parseOverpass(json) {
+      const nodes = new Map();
+      const ways = [];
+      for (const el of json.elements) {
+        if (el.type === 'node') nodes.set(el.id, { id: el.id, lon: el.lon, lat: el.lat });
+        else if (el.type === 'way') ways.push(el);
+      }
+      return { nodes, ways };
+    }
+
+    function buildCity(parsed) {
+      const { nodes, ways } = parsed;
+      if (!centerLL) return;
+
+      clearCity();
+      const roadNodeSet = new Set();
+      const roadPositions = []; // for building->road distance
+
+      for (const way of ways) {
+        const tags = way.tags || {};
+        const isRoad = !!tags.highway;
+        const isBuilding = !!tags.building;
+        const coords = way.nodes.map(id => nodes.get(id)).filter(Boolean).map(n => llToXZ(n.lon, n.lat, centerLL[0], centerLL[1]));
+        if (coords.length < 2) continue;
+
+        if (isRoad) {
+          const line = makeLine(coords);
+          line.material.linewidth = 2;
+          line.material.transparent = true; line.material.opacity = 0.6;
+          roadsGroup.add(line);
+
+          coords.forEach(c => roadPositions.push({X:c.X, Z:c.Z}));
+
+          // add nodes + graph edges
+          for (let i=0;i<way.nodes.length;i++){
+            const id = way.nodes[i];
+            const n = nodes.get(id); if (!n) continue;
+            const p = llToXZ(n.lon, n.lat, centerLL[0], centerLL[1]);
+            nodeMap.set(id, { X:p.X, Z:p.Z });
+            roadNodeSet.add(id);
+          }
+          for (let i=0;i<way.nodes.length-1;i++){
+            const a = way.nodes[i], b = way.nodes[i+1];
+            const pa = nodeMap.get(a), pb = nodeMap.get(b);
+            if (!pa || !pb) continue;
+            const cost = Math.hypot(pb.X-pa.X, pb.Z-pa.Z);
+            if (!graph.has(a)) graph.set(a, []);
+            if (!graph.has(b)) graph.set(b, []);
+            graph.get(a).push({ to: b, cost });
+            graph.get(b).push({ to: a, cost });
+          }
+        }
+      }
+
+      // Buildings
+      for (const way of ways) {
+        const tags = way.tags || {};
+        if (!tags.building) continue;
+
+        const coords = way.nodes.map(id => nodes.get(id)).filter(Boolean).map(n => llToXZ(n.lon, n.lat, centerLL[0], centerLL[1]));
+        if (coords.length < 3) continue;
+
+        // Close polygon if needed (epsilon)
+        const first = coords[0];
+        const last = coords[coords.length - 1];
+        const isClosed = Math.hypot(first.X - last.X, first.Z - last.Z) < 1e-6;
+        const pts = isClosed ? coords.slice(0, -1) : coords;
+        if (pts.length < 3) continue;
+
+        const c = centroidXZ(pts);
+
+        // distance to nearest road node (quick check)
+        let minRoadDist = Infinity;
+        for (const rp of roadPositions) {
+          const dist = Math.hypot(c.X - rp.X, c.Z - rp.Z);
+          if (dist < minRoadDist) minRoadDist = dist;
+        }
+
+
+        // 1) Footprint in X–Z (no sign flip)
+        const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.X, p.Z)));
+
+        
+
+                // --- decide tallness ---
+        const levels = parseFloat(tags.levels) || parseFloat(tags['building:levels']) || 3;
+        const nearRoad = minRoadDist < 30;          // within 30 m of any road
+        const isTall = levels > 5 && nearRoad;      // both conditions must be true
+
+        // --- set base height ---
+        const shortHeight = 8;                      // constant for short buildings (in meters)
+        const heightTag = parseFloat(tags.height) || levels * 3.2;
+        const baseHeight = isTall
+        ? Math.max(3, heightTag * heightScale)    // tall buildings use their real height
+        : shortHeight;                            // short ones use constant height
+
+const h = baseHeight;
+        // 2) Extrude (depth = height), then rotate so depth points to Y,
+        //    flip Y to make height positive, and lift it back to ground.
+
+        
+        const geom = new THREE.ExtrudeGeometry(shape, { depth: -h, bevelEnabled: false, steps: 1 });
+
+        // Rotate the XY shape so it's on the XZ ground plane
+        geom.rotateX(Math.PI / 2);
+
+        geom.computeVertexNormals();
+
+       
+
+        const wallMat = new THREE.MeshStandardMaterial({ color: 0x4a5f7f, metalness: 0.5, roughness: 0.4, side: THREE.DoubleSide });
+        const topMat  = new THREE.MeshStandardMaterial({ color: 0x5d7a9e, metalness: 0.6, roughness: 0.25, emissive: 0x2d4a6a, emissiveIntensity: 0.6, side: THREE.DoubleSide });
+        //const mesh = new THREE.Mesh(geom, [wallMat, topMat, topMat]);
+
+        const mesh = new THREE.Mesh(geom, [wallMat, topMat, topMat]);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.castShadow = true; mesh.receiveShadow = true;
+
+        const group = new THREE.Group();
+        group.add(mesh);
+        group.userData = { cX: c.X, cZ: c.Z, nearRoad, baseHeight };
+        buildingsGroup.add(group);
+      }
+
+      roadNodesKD = Array.from(roadNodeSet).map(id => ({ id, X: nodeMap.get(id).X, Z: nodeMap.get(id).Z }));
+
+      // Fit camera
+      const container = buildingsGroup.children.length ? buildingsGroup : roadsGroup;
+      if (container.children.length) {
+        const bbox = new THREE.Box3().setFromObject(container);
+        const size = new THREE.Vector3();
+        bbox.getSize(size);
+        const center = new THREE.Vector3();
+        bbox.getCenter(center);
+        const maxDim = Math.max(size.x, size.z);
+        const fov = camera.fov * (Math.PI/180);
+        let dist = Math.abs(maxDim/2 / Math.tan(fov/2));
+        dist = dist * 1.4;
+        camera.position.set(center.x + dist, center.y + dist*0.6, center.z + dist);
+        controls.target.set(center.x, 0, center.z);
+        controls.update();
+      } else {
+        scene.background = new THREE.Color(0xf3f4f6);
+        if (scene.fog) scene.fog = null;
+        if (ground && ground.material && ground.material.color) ground.material.color.setHex(0xe5e7eb);
+        camera.position.set(0, 400, 600);
+        controls.target.set(0, 0, 0);
+        controls.update();
+      }
+    }
+
+    async function loadCity(q) {
+      try {
+        setStatus('Geocoding…');
+        const { center } = await geocodeCity(q);
+        centerLL = center;
+        setStatus('Fetching OSM (buildings + roads)…');
+        const json = await fetchOverpass(centerLL, areaKm);
+        setStatus('Building scene…');
+        buildCity(parseOverpass(json));
+        setStatus(`Ready — ${buildingsGroup.children.length} buildings, ${roadsGroup.children.length} roads`);
+      } catch (e) {
+        setStatus('Error: ' + (e.message || e));
+        console.error(e);
+        alert(e.message || e);
+      }
+    }
+
+    // UI handlers
+    searchBtn.onclick = () => { 
+      areaKm = parseFloat(areaKmEl.value) || 1.5;
+      tallModeOnly = tallModeEl.checked;
+      loadCity(cityInput.value || 'Donostia, Spain').then(() => spawnAgents(parseInt(agentCountEl.value,10) || 25)); 
+    };
+    spawnBtn.onclick = () => spawnAgents(parseInt(agentCountEl.value,10) || 25);
+    tallModeEl.onchange = () => {
+      tallModeOnly = tallModeEl.checked;
+      if (centerLL) {
+        buildingsGroup.children.forEach(g => {
+          const shouldBeTall = !tallModeOnly || g.userData.nearRoad;
+          const targetScale = shouldBeTall ? heightScale : Math.min(heightScale, 8 / g.userData.baseHeight);
+          g.scale.y = targetScale;
+        });
+      }
+    };
+    heightScaleEl.oninput = (e) => {
+      heightScale = parseFloat(e.target.value);
+      buildingsGroup.children.forEach(g => { 
+        const shouldBeTall = !tallModeOnly || g.userData.nearRoad;
+        const targetScale = shouldBeTall ? heightScale : Math.min(heightScale, 8 / g.userData.baseHeight);
+        g.scale.y = targetScale; 
+      });
+    };
+
+    // Animate
+    let last = performance.now();
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - last)/1000);
+      last = now;
+      for (const a of liveAgents) a.update(dt);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // Initial load
+    cityInput.value = 'Donostia, Spain';
+    setStatus('Loading initial area…');
+    areaKm = parseFloat(areaKmEl.value) || 1.5;
+    loadCity(cityInput.value).then(() => spawnAgents(parseInt(agentCountEl.value,10) || 25));
+
+    // Resize
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Lightweight tests
+    function _testDijkstra() {
+      const g = new Map();
+      const add = (a,b,c)=>{ if(!g.has(a)) g.set(a,[]); if(!g.has(b)) g.set(b,[]); g.get(a).push({to:b,cost:c}); g.get(b).push({to:a,cost:c}); };
+      add('A','B',1); add('B','C',2); add('A','C',5);
+      function dj(startId, goalId){
+        const dist=new Map([[startId,0]]), prev=new Map(), pq=new Map([[startId,0]]), vis=new Set();
+        const pop=()=>{let mk=null,m=Infinity;for(const[k,v] of pq){if(v<m){m=v;mk=k}} if(mk!==null)pq.delete(mk);return mk};
+        while(pq.size){ const u=pop(); if(!u) break; if(u===goalId) break; vis.add(u); for(const e of g.get(u)||[]){ if(vis.has(e.to)) continue; const nd=(dist.get(u)||Infinity)+e.cost; if(nd<(dist.get(e.to)||Infinity)){ dist.set(e.to,nd); prev.set(e.to,u); pq.set(e.to,nd);} } }
+        const path=[]; let cur=goalId; if(!prev.has(cur) && cur!==startId) return null; while(cur){ path.push(cur); if(cur===startId) break; cur=prev.get(cur);} return path.reverse();
+      }
+      const path = dj('A','C');
+      console.assert(Array.isArray(path) && path.join('-')==='A-B-C', 'Dijkstra test failed', path);
+    }
+
+    function _testProjection() {
+      const origin = {lon:0, lat:0};
+      const a = llToXZ(0,0, origin.lon, origin.lat);
+      const b = llToXZ(0.001,0, origin.lon, origin.lat);
+      console.assert(a.X===0 && a.Z===0, 'llToXZ origin failed');
+      console.assert(b.X>0, 'llToXZ east should increase X');
+    }
+
+    (function runTests(){
+      try { _testDijkstra(); _testProjection(); console.debug('[Tests] Passed'); }
+      catch(e){ console.error('[Tests] Failed', e); }
+    })();
+  </script>
+</body>
+</html>
