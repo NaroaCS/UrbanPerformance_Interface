@@ -1,7 +1,10 @@
+import json
+import pathlib
+import uuid
+
 import numpy as np
 import streamlit as st
 from plotly import graph_objects as go
-import base64, mimetypes, pathlib
 from functools import partial
 
 # ============================================================================
@@ -142,7 +145,8 @@ def apply_custom_css():
 
 CITY_DATA = {
     "Boston": {
-        "video_path": "assets/temp.mov",
+        "map_query": "Boston, Massachusetts, USA",
+        "map_area_km": 2.0,
         "kpis": [
                     # ENVIRONMENTAL
                     {"name": "GHG reduction",              "category": "Environmental", "value": 5.6},
@@ -166,7 +170,8 @@ CITY_DATA = {
         },
     },
     "San Sebastian": {
-        "video_path": "assets/temp.mov",
+        "map_query": "Donostia-San Sebastian, Spain",
+        "map_area_km": 1.5,
         "kpis": [
             # ENVIRONMENTAL
             {"name": "GHG reduction",              "category": "Environmental", "value": 4.8},
@@ -190,6 +195,135 @@ CITY_DATA = {
         },
     },
 }
+
+
+@st.cache_data(show_spinner=False)
+def load_city_visual_template() -> str:
+    template_path = pathlib.Path("visuals/city_test.html")
+    return template_path.read_text(encoding="utf-8")
+
+
+def render_city_visual(city_config: dict, height_scale: float, *, height: int = 520) -> None:
+    frame_id = st.session_state.setdefault(
+        "city_visual_frame_id",
+        f"city-viz-{uuid.uuid4().hex}",
+    )
+
+    html_template = load_city_visual_template()
+    marker = "const EMBEDDED_CONFIG = {}; // __CITY_VIZ_EMBED_CONFIG__"
+
+    city_query = city_config.get("map_query") or ""
+    try:
+        area_value = float(city_config.get("map_area_km", 1.5))
+    except (TypeError, ValueError):
+        area_value = 1.5
+    height_value = round(float(height_scale), 3)
+
+    defaults = {
+        "autoBootstrap": True,
+        "hideUI": True,
+        "cityQuery": city_query,
+        "areaKm": area_value,
+        "agentCount": 100,
+        "tallModeOnly": True,
+        "heightScale": height_value,
+        "agentSpeedMin": 85,
+        "agentSpeedSpread": 35,
+    }
+
+    config_json = json.dumps(defaults).replace("</", "<\\/")
+    html = html_template.replace("__FRAME_ID__", frame_id)
+    if marker in html:
+        html = html.replace(marker, f"const EMBEDDED_CONFIG = {config_json};")
+    st.components.v1.html(html, height=height)
+
+    payload = {
+        "hideUI": True,
+        "cityQuery": city_query,
+        "areaKm": area_value,
+        "agentCount": 100,
+        "tallModeOnly": True,
+        "heightScale": height_value,
+        "agentSpeedMin": 85,
+        "agentSpeedSpread": 35,
+    }
+
+    prev_city = st.session_state.get("city_visual_prev_city")
+    prev_area = st.session_state.get("city_visual_prev_area")
+    current_city = payload["cityQuery"].lower()
+    try:
+        prev_area_val = float(prev_area) if prev_area is not None else None
+    except (TypeError, ValueError):
+        prev_area_val = None
+    try:
+        current_area_val = float(payload["areaKm"])
+    except (TypeError, ValueError):
+        current_area_val = None
+
+    payload["forceReload"] = (
+        prev_city is None
+        or prev_area_val is None
+        or prev_city.lower() != current_city
+        or prev_area_val != current_area_val
+    )
+
+    st.session_state["city_visual_prev_city"] = payload["cityQuery"]
+    st.session_state["city_visual_prev_area"] = current_area_val
+
+    send_city_visual_config(frame_id, payload)
+
+
+def send_city_visual_config(frame_id: str, payload: dict) -> None:
+    message = {
+        "__cityViz": True,
+        "action": "setConfig",
+        "config": payload,
+    }
+    message_json = json.dumps(message).replace("</", "<\\/")
+    script = f"""
+    <script>
+    (function() {{
+        const payload = {message_json};
+        const frameId = "{frame_id}";
+        let attempts = 0;
+        const maxAttempts = 25;
+        const delayMs = 200;
+        let acknowledged = false;
+
+        const handleAck = (event) => {{
+            const data = event.data;
+            if (data && data.__cityVizAck && data.frameId === frameId) {{
+                acknowledged = true;
+                window.removeEventListener('message', handleAck);
+                if (window.parent) try {{ window.parent.removeEventListener('message', handleAck); }} catch (_) {{}}
+            }}
+        }};
+        window.addEventListener('message', handleAck);
+        if (window.parent) try {{ window.parent.addEventListener('message', handleAck); }} catch (_) {{}}
+
+        const send = () => {{
+            if (acknowledged || attempts >= maxAttempts) return;
+            attempts += 1;
+            try {{
+                const doc = window.parent && window.parent.document;
+                if (!doc) throw new Error('no parent document');
+                const frame = doc.getElementById(frameId);
+                if (frame && frame.contentWindow && frame.contentWindow.postMessage) {{
+                    frame.contentWindow.postMessage(payload, '*');
+                }}
+            }} catch (err) {{
+                console.warn('city viz dispatch attempt failed', err);
+            }}
+            if (!acknowledged && attempts < maxAttempts) {{
+                setTimeout(send, delayMs);
+            }}
+        }};
+        send();
+    }})();
+    </script>
+    """
+    st.components.v1.html(script, height=0, width=0)
+
 
 INTERVENTIONS = [
     {
@@ -426,6 +560,13 @@ def calculate_improved_kpis(city_key: str) -> list:
     return improved
 
 
+def slider_to_height_scale(value: float) -> float:
+    value = max(0.0, min(100.0, float(value)))
+    base = 0.5
+    span = 2.5
+    return base + (value / 100.0) * span
+
+
 
 # ============================================================================
 # CHART FUNCTIONS
@@ -583,24 +724,6 @@ def create_time_series_chart(city_key: str, cat_deltas: dict):
     )
     return fig
 
-
-
-
-def autoplay_video(local_path: str, height: int = 360):
-    path = pathlib.Path(local_path)
-    mime = mimetypes.guess_type(path.name)[0] or "video/mp4"
-    data64 = base64.b64encode(path.read_bytes()).decode()
-
-    st.components.v1.html(f"""
-      <div class="video-container" style="position:relative;padding-top:56.25%;">
-        <video autoplay loop muted playsinline preload="metadata"
-               style="position:absolute;inset:0;width:100%;height:100%;">
-          <source src="data:{mime};base64,{data64}" type="{mime}">
-          Your browser does not support the video tag.
-        </video>
-      </div>
-    """, height=height)
-
 def _wrap_label(s: str) -> str:
     # short, readable polar tick labels
     replacements = {
@@ -721,21 +844,16 @@ def render_intervention_slider(intervention: dict):
 # ============================================================================
 
 def main():
-    """Main application with search+video (left) | time series (right) on the top row,
-    radar full-width below, then interventions."""
+    """Compact header row with aligned search/time-series, followed by city visual, radar, and interventions."""
     apply_custom_css()
 
-   # Title
-    st.markdown("<div class='app-title'>Urban Performance Model</div>", unsafe_allow_html=True)
+    header_left, header_mid, header_right = st.columns([0.26, 0.26, 0.48], gap="medium")
 
-    # -------------------------------
-    # ROW 1: Search + Time Series
-    # -------------------------------
-    st.markdown("<div class='section-label'>City Search</div>", unsafe_allow_html=True)
-    row1_left, row1_right = st.columns([0.42, 0.58], gap="medium")
+    with header_left:
+        st.markdown("<div class='app-title'>Urban Performance Model</div>", unsafe_allow_html=True)
 
-    with row1_left:
-        # Short search input (width constrained by CSS .search-wrap)
+    with header_mid:
+        st.markdown("<div class='section-label'>City Search</div>", unsafe_allow_html=True)
         st.markdown("<div class='search-wrap'>", unsafe_allow_html=True)
         search_query = st.text_input(
             "Search City",
@@ -746,52 +864,64 @@ def main():
         )
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Resolve selected city
-        city_key = find_city(search_query)
+    has_city_input = bool(search_query.strip())
+    city_key = find_city(search_query) if has_city_input else None
 
-    # Pre-compute KPI vectors for radar
-    kpis = CITY_DATA[city_key]["kpis"]
-    current_values  = [k["value"] for k in kpis]
-    improved_values = calculate_improved_kpis(city_key)
-    labels          = [k["name"] for k in kpis]
-    categories      = [k["category"] for k in kpis]
+    if city_key:
+        kpis = CITY_DATA[city_key]["kpis"]
+        current_values  = [k["value"] for k in kpis]
+        improved_values = calculate_improved_kpis(city_key)
+        labels          = [k["name"] for k in kpis]
+        categories      = [k["category"] for k in kpis]
+        cat_deltas = category_improvement_from_kpis(current_values, improved_values, categories)
+        category_scores = compute_category_scores()
+    else:
+        kpis = []
+        current_values = []
+        improved_values = []
+        labels = []
+        categories = []
+        cat_deltas = {}
+        category_scores = None
 
-    # NEW: time-series responsiveness driven by KPI improvement
-    cat_deltas = category_improvement_from_kpis(current_values, improved_values, categories)
-
-    # Compute scores once (used by both charts below)
-    category_scores = compute_category_scores()
-
-    with row1_right:
+    with header_right:
         st.markdown("<div class='section-label'>Time Series Projection</div>", unsafe_allow_html=True)
-        ts_chart = create_time_series_chart(city_key, category_scores)
-        st.plotly_chart(ts_chart, use_container_width=True, config={"displayModeBar": False})
+        if city_key:
+            ts_chart = create_time_series_chart(city_key, category_scores)
+            st.plotly_chart(ts_chart, use_container_width=True, config={"displayModeBar": False})
+        else:
+            st.info("Enter a city to view projections.")
 
 
 
+
+    urban_form_value = float(st.session_state.get("main_urban_form", 0))
+    height_scale = slider_to_height_scale(urban_form_value)
 
     # -------------------------------
-    # ROW 2: Video + KPI Radar
+    # ROW 2: City Visual + KPI Radar
     # -------------------------------
     row2_left, row2_right = st.columns([0.42, 0.58], gap="medium")
 
     with row2_left:
         st.markdown("<div class='section-label'>Overview</div>", unsafe_allow_html=True)
-        try:
-            video_path = CITY_DATA[city_key]["video_path"]
-            #st.markdown('<div class="video-container">', unsafe_allow_html=True)
-            #st.video(video_path)
-            #st.markdown('</div>', unsafe_allow_html=True)
-            autoplay_video(video_path)
-           
-        except Exception:
-            st.info(f"📹 Place '{CITY_DATA[city_key]['video_path']}' here")
+        if city_key:
+            try:
+                render_city_visual(CITY_DATA[city_key], height_scale)
+            except Exception as exc:
+                st.error("🗺️ Unable to load the city visualization.")
+                st.exception(exc)
+        else:
+            st.info("Type a city name to load the 3D overview.")
 
     with row2_right:
         st.markdown("<div class='section-label'>KPI Radar</div>", unsafe_allow_html=True)
-        labels = [_wrap_label(k["name"]) for k in kpis]
-        radar_chart = create_radar_chart(current_values, improved_values, labels, categories)
-        st.plotly_chart(radar_chart, use_container_width=True, config={"displayModeBar": False})
+        if city_key:
+            labels_wrapped = [_wrap_label(k["name"]) for k in kpis]
+            radar_chart = create_radar_chart(current_values, improved_values, labels_wrapped, categories)
+            st.plotly_chart(radar_chart, use_container_width=True, config={"displayModeBar": False})
+        else:
+            st.info("KPI radar will appear after selecting a city.")
 
     # -------------------------------
     # INTERVENTIONS

@@ -51,6 +51,56 @@
     const areaKmEl = document.getElementById('areaKm');
     const statusEl = document.getElementById('status');
 
+    const FRAME_ID = "__FRAME_ID__";
+    if (window.frameElement) window.frameElement.id = FRAME_ID;
+
+    const parseWithFallback = (value, fallback) => {
+      const n = parseFloat(value);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    const parseIntWithFallback = (value, fallback) => {
+      const n = parseInt(value, 10);
+      return Number.isFinite(n) ? n : fallback;
+    };
+
+    const EMBEDDED_CONFIG = {}; // __CITY_VIZ_EMBED_CONFIG__
+    const CONFIG = window.__CITY_VIZ_CONFIG__ || EMBEDDED_CONFIG || {};
+    const defaultCity = (CONFIG.cityQuery || 'Donostia, Spain').trim();
+    const defaultAreaKm = parseWithFallback(CONFIG.areaKm, 1.5);
+    const defaultAgentCount = parseIntWithFallback(CONFIG.agentCount, 25);
+    const defaultHeightScale = parseWithFallback(CONFIG.heightScale, 1.0);
+    const defaultTallMode = CONFIG.tallModeOnly === undefined ? false : !!CONFIG.tallModeOnly;
+    const agentSpeedMin = parseWithFallback(CONFIG.agentSpeedMin, 85);
+    const agentSpeedSpread = parseWithFallback(CONFIG.agentSpeedSpread, 35);
+
+    const statusMirrors = [];
+    if (CONFIG.hideUI) {
+      const uiPanel = document.getElementById('ui');
+      if (uiPanel) uiPanel.style.display = 'none';
+      const overlay = document.createElement('div');
+      overlay.id = 'statusOverlay';
+      overlay.style.position = 'absolute';
+      overlay.style.top = '12px';
+      overlay.style.left = '12px';
+      overlay.style.zIndex = '10';
+      overlay.style.padding = '6px 12px';
+      overlay.style.borderRadius = '8px';
+      overlay.style.background = 'rgba(8, 18, 28, 0.72)';
+      overlay.style.color = '#EAF4FF';
+      overlay.style.fontSize = '12px';
+      overlay.style.fontFamily = 'Inter, system-ui, sans-serif';
+      overlay.style.pointerEvents = 'none';
+      overlay.style.boxShadow = '0 6px 24px rgba(0,0,0,0.35)';
+      overlay.textContent = '';
+      document.body.appendChild(overlay);
+      statusMirrors.push(overlay);
+    }
+    if (cityInput) cityInput.value = defaultCity;
+    if (areaKmEl) areaKmEl.value = defaultAreaKm;
+    if (agentCountEl) agentCountEl.value = defaultAgentCount;
+    if (heightScaleEl) heightScaleEl.value = defaultHeightScale;
+    if (tallModeEl) tallModeEl.checked = defaultTallMode;
+
     // Three.js
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -65,11 +115,19 @@
     scene.fog = new THREE.Fog(0x050810, 2000, 12000);
 
     const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200000);
-    camera.position.set(0, 400, 600);
+    camera.position.set(0, 360, 620);
 
+    const ORBIT_SNAPSHOT = { target: new THREE.Vector3(0, 0, 0), distance: 620 };
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 0, 0);
+    controls.target.copy(ORBIT_SNAPSHOT.target);
     controls.enableDamping = true;
+    controls.dampingFactor = 0.12;
+    controls.zoomSpeed = 0.45;
+    controls.panSpeed = 0.28;
+    controls.rotateSpeed = 0.32;
+    controls.minDistance = 70;
+    controls.maxDistance = 2600;
+    controls.maxPolarAngle = Math.PI * 0.48;
 
     // Lights
     const hemi = new THREE.HemisphereLight(0x8bb4ff, 0x1a2332, 0.8);
@@ -100,9 +158,12 @@
 
     // State
     let centerLL = null; // [lon, lat]
-    let areaKm = 1.5;
-    let heightScale = 1.0;
-    let tallModeOnly = false;
+    let areaKm = defaultAreaKm;
+    let heightScale = defaultHeightScale;
+    let tallModeOnly = defaultTallMode;
+    let currentCityName = null;
+    let latestConfig = null;
+    let applyingConfig = false;
 
     // Graph + nodes in scene coordinates (X,Z)
     const nodeMap = new Map(); // osmNodeId -> {X,Z}
@@ -110,7 +171,10 @@
     let roadNodesKD = null;
 
     // Helpers
-    function setStatus(msg){ if (statusEl) statusEl.textContent = msg; }
+    function setStatus(msg){
+      if (statusEl) statusEl.textContent = msg;
+      statusMirrors.forEach(el => el.textContent = msg);
+    }
 
     // Web Mercator projector -> scene X/Z (Y is height)
     const R = 6378137;
@@ -158,7 +222,7 @@
       return new THREE.Line(geom, mat);
     }
 
-    function makeAgent(pathXZ, speed=40) {
+    function makeAgent(pathXZ, speed=80) {
       const mesh = new THREE.Mesh(
         new THREE.SphereGeometry(2.0, 16, 16),
         new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x3b82f6, emissiveIntensity: 1.2, roughness: 0.35, metalness: 0.25 })
@@ -242,9 +306,85 @@
         const ids = dijkstra(oNode, dNode);
         if (!ids || ids.length < 2) continue;
         const pts = ids.map(id => nodeMap.get(id)).map(p => ({ X:p.X, Z:p.Z }));
-        const agent = makeAgent(pts, 35 + Math.random()*20);
+        const agent = makeAgent(pts, agentSpeedMin + Math.random()*agentSpeedSpread);
         liveAgents.push(agent);
       }
+    }
+
+    function applyHeightTweaks() {
+      if (buildingsGroup.children.length === 0) return;
+      buildingsGroup.children.forEach(g => {
+        const shouldBeTall = !tallModeOnly || g.userData.nearRoad;
+        const baseHeight = g.userData.baseHeight || 1;
+        const targetScale = shouldBeTall ? heightScale : Math.min(heightScale, 8 / baseHeight);
+        g.scale.y = targetScale;
+      });
+      camera.position.set(0, 320, ORBIT_SNAPSHOT.distance);
+      controls.target.copy(ORBIT_SNAPSHOT.target);
+      controls.update();
+    }
+
+    async function applyIncomingConfig(cfg) {
+      if (!cfg) return;
+      const targetCity = (cfg.cityQuery || defaultCity).trim();
+      const targetArea = parseWithFallback(cfg.areaKm, areaKm);
+      const targetAgents = parseIntWithFallback(cfg.agentCount, defaultAgentCount);
+      const targetHeight = parseWithFallback(cfg.heightScale, heightScale);
+      const targetTall = cfg.tallModeOnly === undefined ? tallModeOnly : !!cfg.tallModeOnly;
+      const forceReload = !!cfg.forceReload;
+      const areaChanged = Math.abs(targetArea - areaKm) > 1e-6;
+      const cityChanged = !currentCityName || currentCityName.toLowerCase() !== targetCity.toLowerCase();
+
+      areaKm = targetArea;
+      heightScale = targetHeight;
+      tallModeOnly = targetTall;
+
+      if (areaKmEl) areaKmEl.value = areaKm;
+      if (heightScaleEl) heightScaleEl.value = heightScale;
+      if (tallModeEl) tallModeEl.checked = tallModeOnly;
+      if (agentCountEl) agentCountEl.value = targetAgents;
+      if (cityInput) cityInput.value = targetCity;
+
+      const needsReload = cityChanged || areaChanged || forceReload || !centerLL;
+
+      if (needsReload) {
+        setStatus('Updating city…');
+        await loadCity(targetCity);
+      } else {
+        setStatus('Adjusting form…');
+        applyHeightTweaks();
+      }
+
+      currentCityName = targetCity;
+      spawnAgents(targetAgents);
+      setStatus('Ready');
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ __cityVizAck: true, frameId: FRAME_ID }, '*');
+        }
+      } catch (err) {
+        console.warn('Ack post failed', err);
+      }
+    }
+
+    function queueConfig(cfg) {
+      if (!cfg) return;
+      latestConfig = { ...cfg };
+      if (applyingConfig) return;
+      applyingConfig = true;
+      (async function runQueue(){
+        while (latestConfig) {
+          const next = latestConfig;
+          latestConfig = null;
+          try {
+            await applyIncomingConfig(next);
+          } catch (err) {
+            console.error(err);
+            setStatus('Error: ' + (err.message || err));
+          }
+        }
+        applyingConfig = false;
+      })();
     }
 
     function nearestNode(X, Z) {
@@ -475,15 +615,15 @@ const h = baseHeight;
         const maxDim = Math.max(size.x, size.z);
         const fov = camera.fov * (Math.PI/180);
         let dist = Math.abs(maxDim/2 / Math.tan(fov/2));
-        dist = dist * 1.4;
-        camera.position.set(center.x + dist, center.y + dist*0.6, center.z + dist);
+        dist = dist * 1.08;
+        camera.position.set(center.x + dist, center.y + dist*0.5, center.z + dist);
         controls.target.set(center.x, 0, center.z);
         controls.update();
       } else {
         scene.background = new THREE.Color(0xf3f4f6);
         if (scene.fog) scene.fog = null;
         if (ground && ground.material && ground.material.color) ground.material.color.setHex(0xe5e7eb);
-        camera.position.set(0, 400, 600);
+        camera.position.set(0, 280, 420);
         controls.target.set(0, 0, 0);
         controls.update();
       }
@@ -498,39 +638,57 @@ const h = baseHeight;
         const json = await fetchOverpass(centerLL, areaKm);
         setStatus('Building scene…');
         buildCity(parseOverpass(json));
+        applyHeightTweaks();
+        currentCityName = q;
         setStatus(`Ready — ${buildingsGroup.children.length} buildings, ${roadsGroup.children.length} roads`);
+        return true;
       } catch (e) {
         setStatus('Error: ' + (e.message || e));
         console.error(e);
         alert(e.message || e);
+        throw e;
       }
     }
 
-    // UI handlers
-    searchBtn.onclick = () => { 
-      areaKm = parseFloat(areaKmEl.value) || 1.5;
-      tallModeOnly = tallModeEl.checked;
-      loadCity(cityInput.value || 'Donostia, Spain').then(() => spawnAgents(parseInt(agentCountEl.value,10) || 25)); 
-    };
-    spawnBtn.onclick = () => spawnAgents(parseInt(agentCountEl.value,10) || 25);
-    tallModeEl.onchange = () => {
-      tallModeOnly = tallModeEl.checked;
-      if (centerLL) {
-        buildingsGroup.children.forEach(g => {
-          const shouldBeTall = !tallModeOnly || g.userData.nearRoad;
-          const targetScale = shouldBeTall ? heightScale : Math.min(heightScale, 8 / g.userData.baseHeight);
-          g.scale.y = targetScale;
-        });
+    if (searchBtn) {
+      searchBtn.onclick = async () => {
+        areaKm = parseWithFallback(areaKmEl?.value, defaultAreaKm);
+        tallModeOnly = tallModeEl ? !!tallModeEl.checked : defaultTallMode;
+        const cityName = (cityInput?.value || '').trim();
+        if (!cityName) {
+          setStatus('Enter a city name to load the scene.');
+          return;
+        }
+        await loadCity(cityName);
+        spawnAgents(parseIntWithFallback(agentCountEl?.value, defaultAgentCount));
+        applyHeightTweaks();
+      };
+    }
+    if (spawnBtn) {
+      spawnBtn.onclick = () => {
+        spawnAgents(parseIntWithFallback(agentCountEl?.value, defaultAgentCount));
+      };
+    }
+    if (tallModeEl) {
+      tallModeEl.onchange = () => {
+        tallModeOnly = !!tallModeEl.checked;
+        applyHeightTweaks();
+      };
+    }
+    if (heightScaleEl) {
+      heightScaleEl.oninput = (e) => {
+        heightScale = parseWithFallback(e.target.value, heightScale);
+        applyHeightTweaks();
+      };
+    }
+
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (!data || data.__cityViz !== true) return;
+      if (data.action === 'setConfig') {
+        queueConfig(data.config);
       }
-    };
-    heightScaleEl.oninput = (e) => {
-      heightScale = parseFloat(e.target.value);
-      buildingsGroup.children.forEach(g => { 
-        const shouldBeTall = !tallModeOnly || g.userData.nearRoad;
-        const targetScale = shouldBeTall ? heightScale : Math.min(heightScale, 8 / g.userData.baseHeight);
-        g.scale.y = targetScale; 
-      });
-    };
+    });
 
     // Animate
     let last = performance.now();
@@ -545,11 +703,17 @@ const h = baseHeight;
     }
     animate();
 
-    // Initial load
-    cityInput.value = 'Donostia, Spain';
-    setStatus('Loading initial area…');
-    areaKm = parseFloat(areaKmEl.value) || 1.5;
-    loadCity(cityInput.value).then(() => spawnAgents(parseInt(agentCountEl.value,10) || 25));
+    // Initial configuration
+    areaKm = parseWithFallback(areaKmEl?.value, defaultAreaKm);
+    tallModeOnly = tallModeEl ? !!tallModeEl.checked : defaultTallMode;
+    heightScale = parseWithFallback(heightScaleEl?.value, defaultHeightScale);
+
+    if (CONFIG && CONFIG.cityQuery) {
+      setStatus('Loading initial area…');
+      queueConfig(CONFIG);
+    } else {
+      setStatus('Waiting for configuration…');
+    }
 
     // Resize
     window.addEventListener('resize', () => {
